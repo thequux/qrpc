@@ -1,0 +1,344 @@
+\documentclass{book}
+\usepackage[enable,chapter]{easy-todo}
+\usepackage[colorlinks]{hyperref}
+\usepackage{verbatim}
+\usepackage{bytefield}
+\usepackage{noweb}
+
+% Font selection
+\usepackage[T1]{fontenc}
+\usepackage{sourcecodepro}
+\usepackage[default]{sourcesanspro}
+%\renewcommand{\ttdefault}{} % sourcecode pro
+
+\title{QRPC v1.0}
+\author{TQ Hirsch <thequux@upstandinghackers.com>}
+
+\newcommand{\keyword}[1]{``{\tt  #1}''}
+
+\begin{document}
+\frontmatter
+\maketitle
+
+\listoftodos
+\chapter{Introduction}
+QRPC is a system for communicating with network services in a service
+oriented architecture.  While messages may be arbitrary octet strings,
+QRPC was designed with the assumption that messages would be
+marshalled with Google Protocol Buffers.
+
+Unlike other RPC systems, QRPC is designed to require no configuration
+whatsoever, via automatic cluster discovery, and built-in name binding
+and resolution.  Further, we do not require the use of opaque integers
+as identifiers, as is common in other protocols such as TCP.  Names in
+QRPC are arbitrary printable ASCII strings.  Even better, all of these
+features are available to legacy TCP services via a small proxy daemon
+included in the QRPC source tree.
+
+On order for QRPC to work, we place several requirements on the host
+system:
+
+\begin{itemize}
+\item A frontend daemon (qrpcd) to route messages and maintain the
+  process directory. This daemon must be able to communicate with
+  every other machine in the cluster running QRPC on port 11235 (both
+  TCP and UDP).
+\item A shared key infrastructure.  For simple deployments, this can
+  be a single shared secret.  If more control over security is
+  desired, it can also be a Ed25519-based PKI.
+\end{itemize}
+
+\mainmatter{}
+\chapter{Framing}
+All connections start out speaking v1.0 of the cleartext protocol; all
+newer versions or optional protocol components MUST be negotiated
+using a [[VERSION/v1.0]] message (see
+\ref{sec:connection-establishment}).  If a future version of this
+specification requires more complex versioning than [[VERSION/v1.0]]
+can negotiate, a more featureful versioning method SHOULD first be
+negotiated via VERSION/v1.0.
+
+\section{Encrypted Protocol}
+\label{sec:encrypted-protocol}
+
+Encrypted protocol TBD; tunnels plain text protocol
+
+\section{Cleartext Protocol}
+\label{sec:cleartext-protocol}
+
+The entire stream consists of a sequence of PDUs. Each PDU has the
+following binary format:
+
+\begin{bytefield}[bitwidth=1.1em]{32}\\
+  \bitheader{0-31} \\
+  \begin{rightwordgroup}{Header}
+    \bitbox{24}{Message size} & \bitbox{8}{Type}
+  \end{rightwordgroup} \\
+  \wordbox[tlr]{1}{Payload} \\
+  \wordbox[lr]{1}{$\cdots$} \\
+  \bitbox[blr]{16}{} & \bitbox[tl]{16}{}
+\end{bytefield}
+
+The message size is a 3-byte big-endian unsigned integer, measured in
+bytes.  This size includes the 4-byte header.  The type is a one-byte
+message type identifier.  The remainder of the PDU is a
+protobuf-encoded packet; see \ref{file:qrpc.proto} for details.  An
+unknown message type raises a recoverable error of type
+\verb|E_NO_IMPL|.
+
+If the message type is 255, a slightly different protocol is used: 
+
+\begin{bytefield}[bitwidth=1.1em]{32}\\
+  \bitheader{0-31} \\
+  \begin{rightwordgroup}{Header}
+    \bitbox{24}{Message size} & \bitbox{8}{255} \\
+    \bitbox{32}{Message type}
+  \end{rightwordgroup} \\
+  \wordbox[tlr]{1}{Payload} \\
+  \wordbox[lr]{1}{$\cdots$} \\
+  \bitbox[blr]{16}{} & \bitbox[tl]{16}{}
+\end{bytefield}
+
+Note that this is equivalent to an ``extended type'' message, where
+the first four bytes are the message type.  There is no difference
+between the type numbers in this ``extended type'' message and the
+type numbers defined above.  To facilitate this implementation trick,
+message type 255 is reserved.
+
+\chapter{Semantics}
+\section{Connection establishment}
+\label{sec:connection-establishment}
+
+While QRPC is fundamentally a peer-to-peer protocol, the protocol
+initiation flow is inherently directional.  For the purposes of this
+document, we will call the endpoint that initiates the connection the
+``client'' and the endpoint that is connected to will be called the
+``server'', following standard practice.
+
+Upon connection, the client MUST send a [[VERSION/v1.0]] message to the
+server listing the set of extensions and protocol versions that the
+client is willing to use.  The server replies with a [[VERSION/v1.0]]
+message indicating a single protocol version and a set of extensions
+that the connection should use from that point on.  It is a fatal
+error if the server returns more than one protocol version, a protocol
+version or extension that was not listed in the client version
+message, or an invalid\footnote{What makes a combination of
+  extensions/protocol version invalid is beyond the scope of this
+  document.} combination of extensions/protocol version.
+
+<<Message types>>=
+VERSION = 1;
+<<VERSION message>>=
+message Version { // MessageType = VERSION
+  extensions 1000 to max;
+  repeated string protocol = 1; // This file specifies "v1.0"
+  optional string realm = 2; // Each node sends its own realm. If a
+			     // node does not send a realm, it MUST
+			     // configure itself to the realm that is
+			     // sent in reply. Implementations MUST
+			     // NOT accept connections until they are
+			     // configured with a realm.
+}
+@
+
+Immediately after a protocol version is negotiated, any phase-1
+messages are exchanged, followed by phase-2 messages.  While this
+document does not specify any messages to be exchanged in phase-1 and
+phase-2, encryption extensions SHOULD use phase-1 to negotiate an
+encrypted channel, and authentication extensions should use phase-2 to
+authenticate the connection.
+
+After phase-2 (or, if no extensions are in use, after version
+negotiation)\todo{Add DHT initiation in phase 2}, the connection is
+fully established, and the rules in the following section apply.
+
+\section{DHT}
+
+QRPC uses a DHT for configuration-free name database management.  All
+routing nodes SHOULD implement the following DHT messages.  Routing
+nodes MAY be configured to manage the name database with another
+system; see the appropriate extension for your database system for
+details. Forwarding nodes and lightweight nodes MAY leave the DHT
+messages undefined.
+
+The DHT implementation is based on Kademlia, but is mixed with the
+data model of Redis. 
+
+\subsection{Data Model}
+Internal DHT keys are 32-byte SHA256 hashes of the human-readable
+key. Node IDs are thus 256-bit strings.  Values are arbitrary lists of
+byte strings; their interpretation is not of concern here.
+
+<<DHT internal types>>=
+message DHT_Node {
+  required bytes node_id = 1;
+  required int32 ip_addr = 2; // stored little-endian.
+}
+
+message DHT_Value {
+  repeated bytes value = 0;
+}
+@
+
+There are only two message types allocated for DHT messages, one for a
+request, one for a response:
+<<Message types>>=
+  DHT_REQ = 2; // Contains a DHTReq
+  DHT_RESP = 3; // Contains a DHTResp
+@
+
+The various DHT RPCs are contained in extensions of these DHT types;
+if multiple extensions are present, each operation indicated is to be
+performed in an implementation defined order.  Responses will appear
+in the [[DHTResp]] packet in arbitrary order.
+
+<<DHT control messages>>=
+message DHTReq {
+  required int64 message_id = 1;
+  <<DHT request elements>>
+}
+
+message DHTResp {
+  required int64 message_id = 1;
+  <<DHT response elements>>
+}
+
+@
+
+All DHT messages have a message id, which SHOULD be used to associate
+requests with replies.
+
+\subsection{DHT\_Find}
+This RPC combines \verb|FIND_NODE| and \verb|FIND_VALUE| from
+Kademlia.
+
+<<DHT request elements>>=
+repeated DHT_Find find = 100;
+<<DHT response elements>>=
+repeated DHT_FindResp find = 100;
+<<DHT control messages>>=
+<<DHT internal types>>
+
+message DHT_Find {
+  required bytes key = 1;
+}
+
+message DHT_FindResp {
+  required bytes key = 1; // the target of the search.
+  repeated DHT_Node nearby_nodes = 3;
+  optional DHT_Value value = 4;
+}
+
+@
+
+A \keyword{Find} request 
+
+\subsection{DHT\_Push}
+<<DHT control messages>>=
+message DHT_Push {
+  required bytes key = 1;
+  required bytes key_hash = 2; // SHA256(key)
+  required DHT_Value value = 3;
+}
+@
+
+
+\section{Addressing}
+
+Addresses consist of four parts, all but one of which is optional: a
+realm, a service name, an instance id, and a port.  The realm is only
+relevant for running an app in multiple clusters; each node has a
+default, or home, realm that can be referred to with the reserved name
+\keyword{\_local}.  Applications SHOULD either not specify a realm or
+specify \keyword{\_local} as a realm unless specifically configured
+otherwise.  Realms may be auto-discovered during version negotiation;
+see \ref{file:qrpc.proto} for details.
+
+The service name is the only required part of an address; it is a
+human-readable string that identifies the service being addressed.
+Client nodes that do not need to publish services SHOULD pick their
+name using the \keyword{AUTO\_NAME} control message, which will pick a
+globally-unique name that can be routed without being published to the
+DHT. 
+
+Instance IDs identify the specific instance of a service that is being
+addressed.  They MUST be unique within a realm/service name pair, and
+SHOULD be allocated at instance startup by gathering four bytes of
+entropy and hex encoding them.  Alternatively, an external cluster
+management tool MAY assign instance ID's, or they MAY be configured
+statically by a system administrator.  An instance ID of
+\keyword{\_any} will pick a random instance from the set of instances
+published in the DHT.  An unspecified instance ID is exactly
+equivalent to an instance ID of \keyword{\_any}.
+
+Ports provide an optional further level of multiplexing beyond
+instance IDs so that different messages can be handled by different
+processes.  Port names are arbitrary human readable strings.  An
+unspecified port name is exactly equivalent to specifying
+\keyword{\_default}.
+
+All components of a QRPC address SHOULD be valid as RFC1035 domain
+components.  Address components beginning with an underscore
+(\keyword{\_}) are reserved for internal use by QRPC.
+
+\subsection{Automatic name allocation}
+Every routing node, for the purposes of the DHT, has a unique 128-bit
+node ID.  When this is base-64 encoded with the trailing \keyword{=}
+signs removed and \keyword{\_\_} prepended, this forms the ``automatic
+address'' of the routing node.
+
+Forwarding node and lightweight node addresses are derived from the
+routing node's automatic address by appending a  followed by an
+implementation-specific subnode identifier (selected from
+\verb|[a-zA-Z0-9]|). 
+
+\section{Error handling}
+Upon encountering any fatal error, a conforming implementation MUST
+immediately close the connection without performing any additional
+processing. In particular, implementations MUST NOT send any error
+messages to their peer as a result of a fatal error, and
+implementations MUST NOT attempt to make sense of the error-causing
+message.
+
+Unparsable messages and messages that are missing required fields are
+considered fatal errors. This list is not exhaustive.
+
+Upon encountering a recoverable error, a conforming implementation
+MUST send an ERROR message and discard the offending PDU.
+Implementations MUST NOT attempt to make sense of the offending PDU
+and continue processing it.
+
+Receiving an unknown message type is a recoverable error.
+
+\appendix{}
+\chapter{Glossary}
+\begin{description}
+\item[Routing node] A type of node that routes messages around the
+  network via a full mesh topology and participates in DHT maintenance
+  and cluster discovery.
+\item[Forwarding node] A type of node that provides limited routing,
+  but relies another (either forwarding or routing) ``gateway'' node
+  for routing and DHT maintenance.  This node type is intended for use
+  on multitenent servers (such as Docker VMs), but may have other
+  uses.
+\item[Lightweight node] A node that terminates application messages
+  and relies on a gateway node for most of the protocol
+  implementation.  Most service implementations will be this kind of
+  node.
+\item[Auth Token] A cryptographic token that asserts identity and
+  provides a chain of trust to a root identity.
+\end{description}
+
+\chapter{QRPC.proto}
+\label{file:qrpc.proto}
+<<qrpc.proto>>=
+enum MessageType {
+<<Message types>>
+}
+
+<<VERSION message>>
+<<DHT control messages>>
+@
+\verbatiminput{../qrpc.proto}
+
+\end{document}
